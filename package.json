@@ -11,7 +11,7 @@
   },
   "dependencies": {
     "@mixmark-io/domino": "^2.2.0",
-    "turndown": "^7.2.0"
+    "turndown": "^7.2.4"
   },
   "devDependencies": {
     "wrangler": "^4.78.0"
