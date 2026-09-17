@@ -273,6 +273,8 @@ This means the worker is using Turndown's browser build instead of the Node.js b
 
 MIT
 
+When updating Turndown, run `npm run vendor:turndown` and commit `src/turndown.js` with the dependency update. Tests check that this file matches the installed package’s non-browser ES module build.
+
 ## Validation
 
 Run `npm ci`, `npm test`, and `npm run build` before opening a PR. Tests run the Worker in Miniflare with fixture responses; the build is a deployment dry run. CI runs these checks on Node.js 22.
