@@ -8,12 +8,13 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "test": "node --test",
-    "build": "wrangler deploy --dry-run"
+    "test": "node scripts/vendor-turndown.mjs --check && node --test",
+    "build": "wrangler deploy --dry-run",
+    "vendor:turndown": "node scripts/vendor-turndown.mjs"
   },
   "dependencies": {
     "@mixmark-io/domino": "^2.2.0",
-    "turndown": "^7.2.0"
+    "turndown": "^7.2.4"
   },
   "devDependencies": {
     "esbuild": "^0.28.2",
