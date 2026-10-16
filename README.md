@@ -9,9 +9,9 @@ curl -H 'Accept: text/markdown' https://yourblog.com/my-post/   <- same post as 
 https://yourblog.com/llms.txt     <- site index for llms.txt-compatible clients
 ```
 
-The returned Markdown includes YAML frontmatter with title, date, tags, canonical URL, slug, description, author, language, published and updated timestamps, and feature image metadata.
+The returned Markdown includes YAML frontmatter with title, dates, tags, canonical URL, description, authors, language, content type, and feature image metadata. It also retains the article title and important image context in the body.
 
-The worker can also generate a simple `llms.txt` file that points models and tools at the latest post-level Markdown URLs.
+The worker also generates an `llms.txt` file that points tools to public pages, featured posts, and recent posts.
 
 ## How It Works
 
@@ -103,6 +103,8 @@ GHOST_URL = "https://yourblog.com"
 - Ghost is behind Cloudron or another reverse proxy
 - In most cases, this is the same as your public blog URL
 
+Generated `.md` links use the public request domain even when `GHOST_URL` points to a different origin. An explicit canonical URL set on a Ghost post or page is preserved in Markdown frontmatter.
+
 ## Step 4: Deploy
 
 First, log in to Cloudflare via Wrangler (opens a browser window):
@@ -133,14 +135,15 @@ curl -H 'Accept: text/markdown' https://yourblog.com/any-post-slug/
 curl https://yourblog.com/llms.txt
 ```
 
-## Step 5: Configure Caching and Rate Limiting
+## Step 5: Configure Caching
 
 ### Caching
 
 Successful Markdown responses are already cached by the Worker at the edge using Cloudflare's Workers Cache API.
 
 - No extra dashboard cache rule is required for the basic setup
-- The current Worker response headers cache Markdown for 5 minutes and allow a short stale window while a fresh copy is generated
+- The current Worker response headers cache Markdown for 5 minutes. Cloudflare's Workers Cache API does not support `stale-while-revalidate` for `cache.put()` and `cache.match()`
+- Cached Markdown is checked before fetching the Ghost Content API
 - Markdown negotiated from the HTML post URL is cached separately from the HTML representation of that same URL
 - This cache is per Cloudflare data center, so the first `.md` request in a new region may still hit Ghost
 - Cache API behavior only works on your proxied custom domain, not in the Workers editor or Playground preview
@@ -185,11 +188,15 @@ title: "My Blog Post Title"
 slug: "my-blog-post-title"
 description: "Short post summary"
 author: "Jane Doe"
+authors: ["Jane Doe"]
+content_type: "post"
 lang: "en"
 date: "2024-06-15"
 published_at: "2024-06-15T08:30:00.000Z"
 updated_at: "2024-06-16T10:12:00.000Z"
 feature_image: "https://yourblog.com/content/images/2024/06/cover.jpg"
+feature_image_alt: "A descriptive image alternative"
+feature_image_caption: "Image credit or context"
 tags: ["javascript", "cloudflare", "ghost"]
 canonical_url: "https://yourblog.com/my-blog-post-title/"
 ---
@@ -197,14 +204,16 @@ canonical_url: "https://yourblog.com/my-blog-post-title/"
 
 ### llms.txt
 
-The worker can generate `https://yourblog.com/llms.txt` using Ghost site settings plus the latest published posts from the Ghost Content API.
+The worker generates `https://yourblog.com/llms.txt` using Ghost site settings and the Content API. It keeps this file compact by listing up to 25 public pages, 10 featured posts, and 25 recent posts, with duplicates removed. Mark an enduring post as featured in Ghost to keep it discoverable after it leaves the recent list.
 
 The file includes:
 
 - the site title
 - the site description
 - a short note that `.md` URLs and `Accept: text/markdown` are available
-- a list of recent published posts pointing at their Markdown URLs
+- links to public pages, featured posts, and recent posts on the public blog domain
+
+`llms.txt` is a navigation aid for clients that use it. Google Search does not use it as a special ranking signal; keep your HTML pages crawlable and useful to readers. If ChatGPT Search visibility matters, also verify that your `robots.txt` and Cloudflare bot rules allow OAI-SearchBot to access public pages. See [Google's guidance for generative AI Search](https://developers.google.com/search/docs/fundamentals/ai-optimization-guide) and [OpenAI's crawler guidance](https://developers.openai.com/api/docs/bots).
 
 ### Ghost-Specific Conversions
 
@@ -212,9 +221,10 @@ The worker handles Ghost's custom HTML cards:
 
 | Ghost Card | Markdown Output |
 |---|---|
-| Image card (`kg-image-card`) | `![caption](url)` |
-| Bookmark card (`kg-bookmark-card`) | `[Title](url)` |
+| Image card (`kg-image-card`) | Image with its alt text, followed by its caption |
+| Bookmark card (`kg-bookmark-card`) | Linked title with the bookmark description |
 | Code blocks with language | Fenced code blocks with language identifier |
+| Simple tables | GitHub-flavored Markdown table; complex merged-cell tables retain their HTML |
 | Standard HTML | Converted via [Turndown](https://github.com/mixmark-io/turndown) |
 
 ### Alternate Link Injection
@@ -229,11 +239,12 @@ It also adds the corresponding HTTP response header:
 
 ```http
 Link: <https://yourblog.com/my-post.md>; rel="alternate"; type="text/markdown"
+Link: <https://yourblog.com/llms.txt>; rel="describedby"
 ```
 
-The worker preserves nested post paths, so `/notes/my-post/` advertises `/notes/my-post.md`.
+The worker preserves nested post and page paths, so `/notes/my-post/` advertises `/notes/my-post.md`. Markdown responses link back to `/llms.txt` with `rel="describedby"`. The homepage and collection pages link to `/llms.txt` without advertising a Markdown alternate.
 
-This is skipped for the homepage, Ghost admin pages, Ghost asset paths (`/assets/`, `/content/`), collection pages such as `/tag/...` and `/author/...`, pagination paths like `/page/2/`, and existing file paths. HTML and Markdown responses that participate in negotiation also include `Vary: Accept`.
+Markdown alternates are skipped for the homepage, Ghost admin pages, Ghost asset paths (`/assets/`, `/content/`), collection pages such as `/tag/...` and `/author/...`, pagination paths like `/page/2/`, and existing file paths. Admin and asset paths receive no discovery links. HTML and Markdown responses that participate in negotiation also include `Vary: Accept`.
 
 ## Troubleshooting
 

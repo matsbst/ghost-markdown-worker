@@ -2,8 +2,10 @@
 import TurndownService from './turndown.js';
 
 const LLMS_POST_LIMIT = 25;
+const LLMS_FEATURED_LIMIT = 10;
+const LLMS_PAGE_LIMIT = 25;
 const MARKDOWN_CONTENT_TYPE = 'text/markdown; charset=utf-8';
-const MARKDOWN_CACHE_CONTROL = 'public, max-age=300, s-maxage=300, stale-while-revalidate=60';
+const MARKDOWN_CACHE_CONTROL = 'public, max-age=300, s-maxage=300';
 const MARKDOWN_CACHE_BUSTER = '__gmw_repr=markdown';
 
 const turndown = new TurndownService({
@@ -21,9 +23,10 @@ turndown.addRule('ghostImage', {
     const img = node.querySelector('img');
     const figcaption = node.querySelector('figcaption');
     if (!img) return content;
-    const alt = figcaption ? figcaption.textContent.trim() : (img.alt || '');
+    const alt = img.alt || '';
     const src = img.getAttribute('src') || '';
-    return `\n![${alt}](${src})\n`;
+    const caption = figcaption?.textContent.trim();
+    return `\n\n![${escapeMarkdownInline(alt)}](${escapeMarkdownUrl(src)})${caption ? `\n\n*${escapeMarkdownInline(caption)}*` : ''}\n\n`;
   },
 });
 
@@ -35,10 +38,33 @@ turndown.addRule('ghostBookmark', {
   replacement(content, node) {
     const link = node.querySelector('a.kg-bookmark-container');
     const title = node.querySelector('.kg-bookmark-title');
+    const description = node.querySelector('.kg-bookmark-description');
     if (!link) return content;
     const href = link.getAttribute('href') || '';
     const text = title ? title.textContent.trim() : href;
-    return `\n[${text}](${href})\n`;
+    const summary = description?.textContent.trim();
+    return `\n\n[${escapeMarkdownInline(text)}](${escapeMarkdownUrl(href)})${summary ? ` — ${escapeMarkdownInline(summary)}` : ''}\n\n`;
+  },
+});
+
+// Turndown does not convert tables by default. Preserve simple tables as GFM.
+turndown.addRule('table', {
+  filter: 'table',
+  replacement(content, node) {
+    const rows = Array.from(node.querySelectorAll('tr')).map((row) =>
+      Array.from(row.children).filter((cell) => cell.nodeName === 'TH' || cell.nodeName === 'TD')
+    );
+    const width = rows[0]?.length || 0;
+    if (!width || node.querySelector('table') || rows.some((row) =>
+      row.length !== width || row.some((cell) => cell.hasAttribute('rowspan') || cell.hasAttribute('colspan'))
+    )) {
+      return `\n\n${node.outerHTML}\n\n`;
+    }
+
+    const renderRow = (row) => `| ${row.map((cell) =>
+      turndown.turndown(cell.innerHTML).replace(/\n+/g, '<br>').replace(/\|/g, '\\|')
+    ).join(' | ')} |`;
+    return `\n\n${[renderRow(rows[0]), `| ${Array(width).fill('---').join(' | ')} |`, ...rows.slice(1).map(renderRow)].join('\n')}\n\n`;
   },
 });
 
@@ -88,11 +114,21 @@ async function handleLlmsTxtRequest(request, url, env, ctx) {
     return asHeadResponseIfNeeded(request, cachedResponse);
   }
 
-  const [settings, posts] = await Promise.all([
+  const [settings, pages, featured, posts] = await Promise.all([
     fetchGhostJson(
       `${ghostUrl}/ghost/api/content/settings/?key=${ghostApiKey}`,
       '/llms.txt',
       'Ghost settings'
+    ),
+    fetchGhostJson(
+      `${ghostUrl}/ghost/api/content/pages/?key=${ghostApiKey}&limit=${LLMS_PAGE_LIMIT}`,
+      '/llms.txt',
+      'Ghost page index'
+    ),
+    fetchGhostJson(
+      `${ghostUrl}/ghost/api/content/posts/?key=${ghostApiKey}&filter=featured:true&limit=${LLMS_FEATURED_LIMIT}`,
+      '/llms.txt',
+      'Ghost featured post index'
     ),
     fetchGhostJson(
       `${ghostUrl}/ghost/api/content/posts/?key=${ghostApiKey}&limit=${LLMS_POST_LIMIT}`,
@@ -105,38 +141,28 @@ async function handleLlmsTxtRequest(request, url, env, ctx) {
     return settings.error;
   }
 
-  if (posts.error) {
-    return posts.error;
+  for (const result of [pages, featured, posts]) {
+    if (result.error) return result.error;
   }
 
   const site = settings.data.settings || {};
-  const recentPosts = posts.data.posts || [];
   const siteTitle = site.title || url.hostname;
   const siteDescription = site.description || `Published Ghost posts from ${url.hostname}`;
 
   const lines = [
-    `# ${siteTitle}`,
+    `# ${escapeMarkdownInline(sanitizeText(siteTitle))}`,
     '',
-    `> ${siteDescription}`,
+    `> ${escapeMarkdownInline(sanitizeText(siteDescription))}`,
     '',
-    'This site exposes published Ghost posts as Markdown by appending `.md` to post URLs or by sending `Accept: text/markdown` to the HTML URL.',
-    '',
-    '## Recent posts',
+    'Published posts and pages are available as Markdown at the linked `.md` URLs or with `Accept: text/markdown` on their HTML URLs.',
   ];
 
-  if (recentPosts.length === 0) {
-    lines.push('', 'No published posts were returned by the Ghost Content API.');
-  } else {
-    for (const post of recentPosts) {
-      const markdownUrl = buildMarkdownUrlForPost(post, url.origin);
-      if (!markdownUrl) {
-        continue;
-      }
-
-      const summary = post.custom_excerpt || post.excerpt;
-      const summaryText = summary ? `: ${sanitizeText(summary)}` : '';
-      lines.push(`- [${escapeMarkdownLinkText(post.title)}](${markdownUrl})${summaryText}`);
-    }
+  const seen = new Set();
+  appendLlmsSection(lines, 'Pages', pages.data.pages || [], url.origin, seen);
+  appendLlmsSection(lines, 'Featured posts', featured.data.posts || [], url.origin, seen);
+  appendLlmsSection(lines, 'Recent posts', posts.data.posts || [], url.origin, seen);
+  if (seen.size === 0) {
+    lines.push('', 'No public posts or pages were returned by the Ghost Content API.');
   }
 
   const response = new Response(`${lines.join('\n')}\n`, {
@@ -166,47 +192,43 @@ async function handleMarkdownRequest(request, url, env, ctx, requestMode) {
     return new Response('GHOST_API_KEY not configured', { status: 500 });
   }
 
-  const postResult = await fetchGhostJson(
-    `${ghostUrl}/ghost/api/content/posts/slug/${slug}/?key=${ghostApiKey}&formats=html&include=authors,tags`,
-    url.pathname,
-    'Ghost post lookup'
-  );
-
-  if (postResult.error) {
-    if (postResult.status === 404) {
-      return new Response(`Post not found: ${slug}`, { status: 404 });
-    }
-
-    return postResult.error;
-  }
-
-  const post = postResult.data.posts?.[0];
-  if (!post) {
-    return new Response(`Post not found: ${slug}`, { status: 404 });
-  }
-
-  const canonicalUrl = post.url || `${ghostUrl}/${slug}/`;
-  let canonicalPath;
-  try {
-    canonicalPath = normalizePathname(new URL(canonicalUrl).pathname);
-  } catch (err) {
-    console.error('Invalid canonical URL from Ghost', {
-      path: url.pathname,
-      canonicalUrl,
-      error: formatError(err),
-    });
-    return new Response('Invalid canonical URL', { status: 502 });
-  }
-
-  if (requestMode.htmlPath !== canonicalPath) {
-    return new Response('Canonical URL mismatch', { status: 404 });
-  }
-
   const cache = caches.default;
-  const cacheKey = createMarkdownCacheKey(url, canonicalPath);
+  const cacheKey = createMarkdownCacheKey(url, requestMode.htmlPath);
   const cachedResponse = await cache.match(cacheKey);
   if (cachedResponse) {
     return asHeadResponseIfNeeded(request, cachedResponse);
+  }
+
+  let post;
+  let contentType;
+  for (const resource of ['posts', 'pages']) {
+    const result = await fetchGhostJson(
+      `${ghostUrl}/ghost/api/content/${resource}/slug/${slug}/?key=${ghostApiKey}&formats=html&include=authors,tags`,
+      url.pathname,
+      `Ghost ${resource} lookup`
+    );
+    if (result.error) {
+      if (result.status === 404) continue;
+      return result.error;
+    }
+
+    const candidate = result.data[resource]?.[0];
+    if (!candidate) continue;
+    try {
+      const candidatePath = normalizePathname(new URL(candidate.url || `${url.origin}${requestMode.htmlPath}/`).pathname);
+      if (candidatePath !== requestMode.htmlPath) continue;
+    } catch (err) {
+      console.error('Invalid Ghost content URL', { path: url.pathname, error: formatError(err) });
+      return new Response('Invalid content URL', { status: 502 });
+    }
+
+    post = candidate;
+    contentType = resource === 'posts' ? 'post' : 'page';
+    break;
+  }
+
+  if (!post || post.access === false || post.html == null) {
+    return new Response(`Public content not found: ${slug}`, { status: 404 });
   }
 
   const settingsResult = await fetchGhostJson(
@@ -220,7 +242,9 @@ async function handleMarkdownRequest(request, url, env, ctx, requestMode) {
   const publishedDate = post.published_at ? post.published_at.split('T')[0] : '';
   const description = post.meta_description || post.custom_excerpt || post.excerpt || '';
   const author = post.primary_author?.name || '';
+  const authors = (post.authors || (post.primary_author ? [post.primary_author] : [])).map((item) => item.name);
   const lang = settings?.lang || '';
+  const canonicalUrl = post.canonical_url || `${url.origin}${requestMode.htmlPath}/`;
 
   const frontmatter = [
     '---',
@@ -228,24 +252,33 @@ async function handleMarkdownRequest(request, url, env, ctx, requestMode) {
     `slug: "${escapeYaml(post.slug || '')}"`,
     `description: "${escapeYaml(description)}"`,
     `author: "${escapeYaml(author)}"`,
+    `authors: [${authors.map((name) => `"${escapeYaml(name)}"`).join(', ')}]`,
+    `content_type: "${contentType}"`,
     `lang: "${escapeYaml(lang)}"`,
     `date: ${publishedDate ? `"${escapeYaml(publishedDate)}"` : '""'}`,
     `published_at: "${escapeYaml(post.published_at || '')}"`,
     `updated_at: "${escapeYaml(post.updated_at || '')}"`,
     `feature_image: "${escapeYaml(post.feature_image || '')}"`,
+    `feature_image_alt: "${escapeYaml(post.feature_image_alt || '')}"`,
+    `feature_image_caption: "${escapeYaml(post.feature_image_caption || '')}"`,
     `tags: [${tags.map((tag) => `"${escapeYaml(tag)}"`).join(', ')}]`,
     `canonical_url: "${escapeYaml(canonicalUrl)}"`,
     '---',
   ].join('\n');
 
-  const markdown = turndown.turndown(post.html || '');
-  const body = `${frontmatter}\n\n${markdown}\n`;
+  const markdown = turndown.turndown(post.html).trim();
+  const heading = /^#\s/m.test(markdown) ? '' : `# ${escapeMarkdownInline(sanitizeText(post.title))}`;
+  const featureImage = post.feature_image && !post.html.includes(post.feature_image)
+    ? `![${escapeMarkdownInline(post.feature_image_alt || '')}](${escapeMarkdownUrl(post.feature_image)})${post.feature_image_caption ? `\n\n*${escapeMarkdownInline(post.feature_image_caption)}*` : ''}`
+    : '';
+  const body = `${frontmatter}\n\n${[heading, featureImage, markdown].filter(Boolean).join('\n\n')}\n`;
   const response = new Response(body, {
     status: 200,
     headers: {
       'Content-Type': MARKDOWN_CONTENT_TYPE,
       'Cache-Control': MARKDOWN_CACHE_CONTROL,
       'Vary': 'Accept',
+      'Link': `<${url.origin}/llms.txt>; rel="describedby"`,
     },
   });
 
@@ -266,31 +299,37 @@ async function handleHtmlPassthrough(request, url) {
   }
 
   const contentType = response.headers.get('content-type') || '';
-  if (!contentType.includes('text/html')) {
+  if (!response.ok || !contentType.includes('text/html')) {
     return response;
   }
 
   const mdUrl = buildMdUrl(url);
-  if (!mdUrl) {
+  if (/^\/(?:ghost|assets|content)(?:\/|$)/.test(url.pathname)) {
     return response;
   }
 
   if (request.method === 'HEAD') {
-    return addAlternateMarkdownHeaders(response, mdUrl);
+    return addDiscoveryHeaders(response, mdUrl, url.origin);
   }
 
   const rewritten = new HTMLRewriter()
     .on('head', {
       element(element) {
+        if (mdUrl) {
+          element.append(
+            `<link rel="alternate" type="text/markdown" href="${mdUrl}" />`,
+            { html: true }
+          );
+        }
         element.append(
-          `<link rel="alternate" type="text/markdown" href="${mdUrl}" />`,
+          `<link rel="describedby" href="${url.origin}/llms.txt" />`,
           { html: true }
         );
       },
     })
     .transform(response);
 
-  return addAlternateMarkdownHeaders(rewritten, mdUrl);
+  return addDiscoveryHeaders(rewritten, mdUrl, url.origin);
 }
 
 function classifyRequest(request, url) {
@@ -360,18 +399,21 @@ function buildMdUrl(url) {
   return `${url.origin}${path}.md`;
 }
 
-function createMarkdownCacheKey(url, canonicalPath) {
+function createMarkdownCacheKey(url, htmlPath) {
   const cacheUrl = new URL(url.toString());
-  cacheUrl.pathname = canonicalPath;
+  cacheUrl.pathname = htmlPath;
   cacheUrl.search = `?${MARKDOWN_CACHE_BUSTER}`;
   cacheUrl.hash = '';
   return new Request(cacheUrl.toString(), { method: 'GET' });
 }
 
-function addAlternateMarkdownHeaders(response, mdUrl) {
+function addDiscoveryHeaders(response, mdUrl, origin) {
   const headers = new Headers(response.headers);
-  headers.append('Link', `<${mdUrl}>; rel="alternate"; type="text/markdown"`);
-  addVaryValue(headers, 'Accept');
+  if (mdUrl) {
+    headers.append('Link', `<${mdUrl}>; rel="alternate"; type="text/markdown"`);
+    addVaryValue(headers, 'Accept');
+  }
+  headers.append('Link', `<${origin}/llms.txt>; rel="describedby"`);
 
   return new Response(response.body, {
     status: response.status,
@@ -484,12 +526,12 @@ function formatError(err) {
   return err instanceof Error ? err.message : String(err);
 }
 
-function buildMarkdownUrlForPost(post, publicOrigin) {
-  const canonicalUrl = post.url || `${publicOrigin}/${post.slug}/`;
+function buildMarkdownUrlForEntry(entry, publicOrigin) {
+  const entryUrl = entry.url || `${publicOrigin}/${entry.slug}/`;
 
   try {
-    const parsedUrl = new URL(canonicalUrl);
-    return buildMarkdownUrlFromPath(parsedUrl.pathname, parsedUrl.origin);
+    const parsedUrl = new URL(entryUrl);
+    return buildMarkdownUrlFromPath(parsedUrl.pathname, publicOrigin);
   } catch {
     return null;
   }
@@ -501,13 +543,34 @@ function buildMarkdownUrlFromPath(pathname, origin) {
     return null;
   }
 
-  return `${origin}${normalizedPath}.md`;
+  const publicUrl = new URL(origin);
+  publicUrl.pathname = normalizedPath;
+  return buildMdUrl(publicUrl);
 }
 
 function sanitizeText(str) {
-  return str.replace(/\s+/g, ' ').trim();
+  return String(str).replace(/\s+/g, ' ').trim();
 }
 
-function escapeMarkdownLinkText(str) {
-  return String(str).replace(/([\\[\]])/g, '\\$1');
+function escapeMarkdownInline(str) {
+  return sanitizeText(str).replace(/([\\`*_{}\[\]<>!#])/g, '\\$1');
+}
+
+function escapeMarkdownUrl(str) {
+  return String(str).replace(/\\/g, '%5C').replace(/\(/g, '%28').replace(/\)/g, '%29').replace(/\s/g, '%20');
+}
+
+function appendLlmsSection(lines, title, entries, publicOrigin, seen) {
+  const links = [];
+  for (const entry of entries) {
+    if (entry.access === false || (entry.html == null) || (!entry.html && !entry.feature_image)) continue;
+    const markdownUrl = buildMarkdownUrlForEntry(entry, publicOrigin);
+    if (!markdownUrl || seen.has(markdownUrl)) continue;
+
+    seen.add(markdownUrl);
+    const summary = entry.custom_excerpt || entry.excerpt;
+    links.push(`- [${escapeMarkdownInline(entry.title || entry.slug)}](${escapeMarkdownUrl(markdownUrl)})${summary ? `: ${escapeMarkdownInline(summary)}` : ''}`);
+  }
+
+  if (links.length) lines.push('', `## ${title}`, '', ...links);
 }
