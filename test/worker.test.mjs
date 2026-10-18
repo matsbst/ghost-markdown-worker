@@ -16,6 +16,7 @@ before(async () => {
     const path = new URL(request.url).pathname;
     if (path.startsWith('/ghost/api/content/settings/')) return Response.json({ settings: { title: 'Test blog', description: 'A fixture', lang: 'en' } });
     if (path.startsWith('/ghost/api/content/posts/')) return Response.json({ posts: [post] });
+    if (path.startsWith('/ghost/api/content/pages/')) return Response.json({ pages: [] });
     if (path === '/notes/example/' || path === '/tag/testing/') return new Response('<html><head></head><body>Original HTML</body></html>', { headers: { 'content-type': 'text/html' } });
     throw new Error(`Unexpected outbound request: ${request.url}`);
   };
@@ -28,7 +29,7 @@ test('Markdown converts Ghost cards, fenced code, and frontmatter', async () => 
   assert.equal(response.status, 200);
   assert.match(response.headers.get('content-type'), /text\/markdown/);
   const body = await response.text();
-  for (const expected of ['title: "Example"', 'lang: "en"', '## Heading', '![Caption](https://blog.test/image.jpg)', '[Bookmark](https://example.com)', '```js\nconst x = 1;\n```']) assert.ok(body.includes(expected), expected);
+  for (const expected of ['title: "Example"', 'lang: "en"', '## Heading', '![](https://blog.test/image.jpg)', '*Caption*', '[Bookmark](https://example.com)', '```js\nconst x = 1;\n```']) assert.ok(body.includes(expected), expected);
 });
 test('Accept negotiation matches .md and HEAD returns headers without a body', async () => {
   const explicit = await worker.dispatchFetch('https://blog.test/notes/example.md');
@@ -51,7 +52,7 @@ test('q=0 and collection paths remain HTML', async () => {
   const response = await worker.dispatchFetch('https://blog.test/notes/example/', { headers: { Accept: 'text/markdown;q=0' } });
   assert.match(response.headers.get('content-type'), /text\/html/);
   const collection = await worker.dispatchFetch('https://blog.test/tag/testing/', { headers: { Accept: 'text/markdown' } });
-  assert.equal(collection.headers.get('link'), null);
+  assert.equal(collection.headers.get('link'), '<https://blog.test/llms.txt>; rel="describedby"');
   assert.ok(!(await collection.text()).includes('rel="alternate"'));
 });
 test('llms.txt lists canonical nested Markdown URLs', async () => {

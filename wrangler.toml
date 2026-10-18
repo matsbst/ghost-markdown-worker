@@ -4,7 +4,7 @@ compatibility_date = "2024-12-01"
 compatibility_flags = ["nodejs_compat"]
 
 # Set your Ghost blog domain here
-routes = [{ pattern = "yourblog.com/*", zone_name = "yourblog.com" }]
+routes = [{ pattern = "matsbs.com/*", zone_name = "matsbs.com" }]
 
 [vars]
 # GHOST_URL is the origin Ghost blog URL (e.g. https://yourblog.com)
