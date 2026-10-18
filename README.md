@@ -1,291 +1,142 @@
 # Ghost Markdown Worker
 
-A Cloudflare Worker that lets anyone (i.e AI-bots) view any post on your [Ghost](https://ghost.org) blog as clean Markdown, either by changing the URL extension to `.md` or by sending `Accept: text/markdown` to the normal post URL.
+Give public Ghost posts and pages a Markdown version without changing their normal HTML URLs. This Cloudflare Worker also creates an `llms.txt` index and adds discovery links to HTML pages.
 
-```
-https://yourblog.com/my-post/     <- normal HTML post
-https://yourblog.com/my-post.md   <- same post as Markdown
-curl -H 'Accept: text/markdown' https://yourblog.com/my-post/   <- same post as Markdown
-https://yourblog.com/llms.txt     <- site index for llms.txt-compatible clients
-```
+| Request | Result |
+| --- | --- |
+| `https://example.com/notes/my-post/` | The normal Ghost page, with a link to its Markdown version |
+| `https://example.com/notes/my-post.md` | The same post as Markdown |
+| `Accept: text/markdown` on the normal URL | The Markdown version |
+| `https://example.com/llms.txt` | Links to public pages and selected posts |
 
-The returned Markdown includes YAML frontmatter with title, dates, tags, canonical URL, description, authors, language, content type, and feature image metadata. It also retains the article title and important image context in the body.
+Nested post and page URLs work too: `/notes/my-post/` becomes `/notes/my-post.md`.
 
-The worker also generates an `llms.txt` file that points tools to public pages, featured posts, and recent posts.
+## What's new in 1.1
 
-## How It Works
+- `llms.txt` lists public pages, featured posts, and recent posts.
+- HTML pages advertise their Markdown versions with a `<link rel="alternate">` tag and an HTTP `Link` header.
+- Markdown includes richer metadata and preserves Ghost image captions, bookmark descriptions, code blocks, and simple tables.
+- Updated build dependencies and Dependabot coverage keep the project easier to maintain.
 
-The worker sits between visitors and your Ghost blog via Cloudflare's network:
+The worker helps clients find and read your content. `llms.txt` is a navigation aid, not a guarantee of search or AI ranking. Keep your HTML pages accessible to readers and crawlers too.
 
-![Architecture diagram showing two flows: .md requests are intercepted by the Cloudflare Worker which fetches from Ghost Content API, converts HTML to Markdown and returns text/markdown. Regular HTML requests pass through to Ghost and the worker injects a link alternate tag.](docs/architecture.png)
+## Set up your blog
 
-For regular page visits, it passes the request through to Ghost unchanged, injects a `<link rel="alternate" type="text/markdown">` tag, and adds a matching `Link` response header so browsers and tools can discover the Markdown version.
+You need a Ghost blog, a Cloudflare account with its domain proxied (orange cloud), and Node.js 22 or later. The Worker route covers the whole domain; regular HTML requests pass through to Ghost with discovery links added.
 
-### Technical Note: Turndown in Workers
+1. **Get a Ghost Content API key.** In Ghost Admin, create a custom integration and copy its Content API key. The key reads published public content. Keep it out of Git and store it as a Wrangler secret.
+2. **Install the project.**
 
-Cloudflare Workers don't have a native DOM, but the [Turndown](https://github.com/mixmark-io/turndown) library's browser build requires `document` and `DOMParser`. This project uses a local copy of Turndown's Node.js build (`src/turndown.js`) which relies on [@mixmark-io/domino](https://github.com/mixmark-io/domino) for DOM parsing instead. The `nodejs_compat` compatibility flag is required in `wrangler.toml` to support this.
+   ~~~bash
+   git clone https://github.com/matsbst/ghost-markdown-worker.git
+   cd ghost-markdown-worker
+   npm ci
+   ~~~
 
-## Prerequisites
+3. **Set your domain in `wrangler.toml`.** The checked-in route points to `matsbs.com`. Replace it before deploying to another blog. You can also choose a different Worker `name`.
 
-- **A Ghost blog** -- self-hosted (e.g. on Docker, etc.)
-- **A Cloudflare account** (free plan works) with your blog's domain added
-- **Node.js** v22 or later
-- **npm** (comes with Node.js)
+   ~~~toml
+   routes = [{ pattern = "example.com/*", zone_name = "example.com" }]
+   ~~~
 
+   The domain must be in your Cloudflare account and its Ghost DNS record must be proxied. If Ghost's Content API is reachable at a different origin, set `GHOST_URL` to that origin; otherwise the Worker uses the public request origin.
+
+4. **Log in, add the key, and deploy.**
+
+   ~~~bash
+   npx wrangler login
+   npx wrangler secret put GHOST_API_KEY
+   npm run deploy
+   ~~~
+
+   If you need a separate Ghost origin, run `npx wrangler secret put GHOST_URL` before deploying and enter its full URL, such as `https://ghost.example.com`.
+
+5. **Check the result.** Replace `example.com` and the sample slug with your own.
+
+   ~~~bash
+   curl https://example.com/llms.txt
+   curl https://example.com/notes/my-post.md
+   curl -H 'Accept: text/markdown' https://example.com/notes/my-post/
+   ~~~
+
+Your existing HTML URL should still load normally. Its page source and response headers should point to the `.md` URL.
+
+![Architecture diagram showing Markdown requests converted from the Ghost Content API and regular HTML requests passed through with discovery links.](docs/architecture.png)
+
+## What the Worker publishes
+
+### Markdown posts and pages
+
+The Worker looks up a public Ghost post or page by slug, converts its HTML, and returns `text/markdown`. It keeps the article title and useful image context in the body. YAML frontmatter includes title, description, authors, language, publish and update dates, tags, canonical URL, content type, and feature image details.
+
+~~~markdown
 ---
-
-## Step 1: Set Up a Ghost Integration
-
-The worker uses Ghost's **Content API** (read-only) to fetch posts. You need to create an integration to get an API key.
-
-1. Log in to your Ghost Admin panel at `https://yourblog.com/ghost/`
-2. Go to **Settings** (gear icon in the bottom-left)
-3. Scroll down to **Advanced** and click **Integrations**
-4. Click **Add custom integration**
-5. Give it a name (e.g. `Markdown Worker`)
-6. Click **Add**
-7. Copy the **Content API Key** -- you'll need it in Step 4
-
-> The Content API key is read-only. It can only read published posts, so it's safe to use in a worker.
-
-## Step 2: Proxy Your Domain Through Cloudflare
-
-Your blog's domain must be routed through Cloudflare so the worker can intercept requests.
-
-### If your domain is NOT on Cloudflare yet
-
-1. Sign up at [cloudflare.com](https://www.cloudflare.com/)
-2. Click **Add a site** and enter your domain
-3. Select the **Free** plan (or any plan)
-4. Cloudflare will scan your existing DNS records. Verify they look correct
-5. Update your domain's nameservers at your registrar to the ones Cloudflare provides
-6. Wait for nameserver propagation (usually a few minutes, can take up to 24 hours)
-
-### If your domain is already on Cloudflare
-
-Make sure the DNS record pointing to your Ghost server has the **orange cloud** (Proxied) enabled, not "DNS only". This is required for the worker to run.
-
-## Step 3: Configure the Worker
-
-Clone this repo and install dependencies:
-
-```bash
-git clone https://github.com/YOUR_USERNAME/ghost-markdown-worker.git
-cd ghost-markdown-worker
-npm install
-```
-
-Edit `wrangler.toml`:
-
-```toml
-name = "ghost-markdown-worker"
-main = "src/index.js"
-compatibility_date = "2024-12-01"
-compatibility_flags = ["nodejs_compat"]
-
-# Route the worker on your Ghost blog's domain.
-# Replace with your actual domain:
-routes = [{ pattern = "yourblog.com/*", zone_name = "yourblog.com" }]
-
-[vars]
-# The URL where Ghost is actually reachable.
-# If Ghost is on the same domain, you can omit this.
-# If Ghost is behind Cloudron or a reverse proxy, set the origin URL:
-GHOST_URL = "https://yourblog.com"
-```
-
-**`compatibility_flags`** -- `nodejs_compat` is required because the HTML-to-Markdown conversion uses [domino](https://github.com/mixmark-io/domino) for DOM parsing, which relies on Node.js APIs.
-
-**`routes`** -- tells Cloudflare which domain/path this worker should handle. Use your blog's public domain.
-
-**`GHOST_URL`** -- the origin URL where Ghost's API is accessible. This is important if:
-- Ghost runs on a subdomain (`https://ghost.example.com`) but your blog is at `example.com`
-- Ghost is behind Cloudron or another reverse proxy
-- In most cases, this is the same as your public blog URL
-
-Generated `.md` links use the public request domain even when `GHOST_URL` points to a different origin. An explicit canonical URL set on a Ghost post or page is preserved in Markdown frontmatter.
-
-## Step 4: Deploy
-
-First, log in to Cloudflare via Wrangler (opens a browser window):
-
-```bash
-npx wrangler login
-```
-
-Set your Ghost Content API key as an encrypted secret:
-
-```bash
-npx wrangler secret put GHOST_API_KEY
-```
-
-Paste the Content API key you copied from Ghost in Step 1 when prompted.
-
-Deploy the worker:
-
-```bash
-npm run deploy
-```
-
-That's it! Your worker is live. Test it:
-
-```bash
-curl https://yourblog.com/any-post-slug.md
-curl -H 'Accept: text/markdown' https://yourblog.com/any-post-slug/
-curl https://yourblog.com/llms.txt
-```
-
-## Step 5: Configure Caching
-
-### Caching
-
-Successful Markdown responses are already cached by the Worker at the edge using Cloudflare's Workers Cache API.
-
-- No extra dashboard cache rule is required for the basic setup
-- The current Worker response headers cache Markdown for 5 minutes. Cloudflare's Workers Cache API does not support `stale-while-revalidate` for `cache.put()` and `cache.match()`
-- Cached Markdown is checked before fetching the Ghost Content API
-- Markdown negotiated from the HTML post URL is cached separately from the HTML representation of that same URL
-- This cache is per Cloudflare data center, so the first `.md` request in a new region may still hit Ghost
-- Cache API behavior only works on your proxied custom domain, not in the Workers editor or Playground preview
-
-If you want a longer or shorter cache window, change the `Cache-Control` header in `src/index.js`.
-
----
-
-## Local Development
-
-Create a `.dev.vars` file in the project root with your secrets:
-
-```
-GHOST_API_KEY=your_content_api_key_here
-GHOST_URL=https://yourblog.com
-```
-
-> `.dev.vars` is already in `.gitignore` -- never commit this file.
-
-Start the dev server:
-
-```bash
-npm run dev
-```
-
-Wrangler will start a local server (usually at `http://localhost:8787`). Test with:
-
-```bash
-curl http://localhost:8787/my-post.md
-curl -H 'Accept: text/markdown' http://localhost:8787/my-post/
-```
-
-## Output Format
-
-### Frontmatter
-
-Every Markdown file includes YAML frontmatter:
-
-```yaml
----
-title: "My Blog Post Title"
-slug: "my-blog-post-title"
-description: "Short post summary"
-author: "Jane Doe"
+title: "My post"
+description: "A short summary"
 authors: ["Jane Doe"]
 content_type: "post"
 lang: "en"
-date: "2024-06-15"
-published_at: "2024-06-15T08:30:00.000Z"
-updated_at: "2024-06-16T10:12:00.000Z"
-feature_image: "https://yourblog.com/content/images/2024/06/cover.jpg"
-feature_image_alt: "A descriptive image alternative"
-feature_image_caption: "Image credit or context"
-tags: ["javascript", "cloudflare", "ghost"]
-canonical_url: "https://yourblog.com/my-blog-post-title/"
+date: "2026-10-18"
+tags: ["ghost", "cloudflare"]
+canonical_url: "https://example.com/notes/my-post/"
 ---
-```
 
-### llms.txt
+# My post
 
-The worker generates `https://yourblog.com/llms.txt` using Ghost site settings and the Content API. It keeps this file compact by listing up to 25 public pages, 10 featured posts, and 25 recent posts, with duplicates removed. Mark an enduring post as featured in Ghost to keep it discoverable after it leaves the recent list.
+The article starts here.
+~~~
 
-The file includes:
+Ghost image cards retain alt text and captions; bookmark cards retain their linked title and description. Fenced code blocks keep their language. Simple tables become GitHub-flavored Markdown tables; complex merged tables retain their HTML.
 
-- the site title
-- the site description
-- a short note that `.md` URLs and `Accept: text/markdown` are available
-- links to public pages, featured posts, and recent posts on the public blog domain
+Only published, publicly accessible content is returned. The Worker verifies the Ghost content URL before serving a `.md` path, so a slug at a different path cannot be used to fetch the wrong page.
 
-`llms.txt` is a navigation aid for clients that use it. Google Search does not use it as a special ranking signal; keep your HTML pages crawlable and useful to readers. If ChatGPT Search visibility matters, also verify that your `robots.txt` and Cloudflare bot rules allow OAI-SearchBot to access public pages. See [Google's guidance for generative AI Search](https://developers.google.com/search/docs/fundamentals/ai-optimization-guide) and [OpenAI's crawler guidance](https://developers.openai.com/api/docs/bots).
+### `llms.txt` and discovery links
 
-### Ghost-Specific Conversions
+`/llms.txt` uses Ghost's site settings and Content API to list up to 25 public pages, 10 featured posts, and 25 recent posts. Duplicate entries are removed. Feature an enduring post in Ghost to keep it in the index after it leaves the recent list.
 
-The worker handles Ghost's custom HTML cards:
+On eligible HTML posts and pages, the Worker adds a Markdown alternate in `<head>` and an HTTP `Link` header. It also links to `/llms.txt`. The homepage and collection pages link to `/llms.txt` without claiming to have a Markdown alternate. Ghost admin, assets, existing file paths, and pagination paths do not get Markdown alternates.
 
-| Ghost Card | Markdown Output |
-|---|---|
-| Image card (`kg-image-card`) | Image with its alt text, followed by its caption |
-| Bookmark card (`kg-bookmark-card`) | Linked title with the bookmark description |
-| Code blocks with language | Fenced code blocks with language identifier |
-| Simple tables | GitHub-flavored Markdown table; complex merged-cell tables retain their HTML |
-| Standard HTML | Converted via [Turndown](https://github.com/mixmark-io/turndown) |
+Markdown responses also link back to `/llms.txt`. Responses negotiated through `Accept` include `Vary: Accept`.
 
-### Alternate Link Injection
+For search visibility, keep your site's `robots.txt` and Cloudflare bot rules aligned with the crawlers you want to allow. See [Google's guidance for generative AI Search](https://developers.google.com/search/docs/fundamentals/ai-optimization-guide) and [OpenAI's crawler guidance](https://developers.openai.com/api/docs/bots).
 
-On regular HTML pages, the worker injects a discovery tag in `<head>`:
+### Caching
 
-```html
-<link rel="alternate" type="text/markdown" href="https://yourblog.com/my-post.md" />
-```
+Successful Markdown and `llms.txt` responses are cached for five minutes at the Cloudflare edge. The cache is local to each data center, so a first request in a new region may still call Ghost. Change `MARKDOWN_CACHE_CONTROL` in `src/index.js` if you need another duration. No extra dashboard cache rule is required.
 
-It also adds the corresponding HTTP response header:
+## Develop and maintain
 
-```http
-Link: <https://yourblog.com/my-post.md>; rel="alternate"; type="text/markdown"
-Link: <https://yourblog.com/llms.txt>; rel="describedby"
-```
+For local development, put your own values in an ignored `.dev.vars` file:
 
-The worker preserves nested post and page paths, so `/notes/my-post/` advertises `/notes/my-post.md`. Markdown responses link back to `/llms.txt` with `rel="describedby"`. The homepage and collection pages link to `/llms.txt` without advertising a Markdown alternate.
+~~~dotenv
+GHOST_API_KEY=your_content_api_key_here
+GHOST_URL=https://example.com
+~~~
 
-Markdown alternates are skipped for the homepage, Ghost admin pages, Ghost asset paths (`/assets/`, `/content/`), collection pages such as `/tag/...` and `/author/...`, pagination paths like `/page/2/`, and existing file paths. Admin and asset paths receive no discovery links. HTML and Markdown responses that participate in negotiation also include `Vary: Accept`.
+Then run `npm run dev` and visit `http://localhost:8787/llms.txt` or a `.md` URL. Never commit `.dev.vars`.
+
+Before a pull request, run:
+
+~~~bash
+npm ci
+npm test
+npm run build
+~~~
+
+The tests use fixture responses in Miniflare. The build command is a deployment dry run. CI checks both on Node.js 22. Dependabot checks npm dependencies and GitHub Actions weekly; security updates are enabled for the repository.
+
+The project vendors Turndown's non-browser build in `src/turndown.js` because the browser build needs DOM APIs unavailable in Workers. When updating Turndown, run `npm run vendor:turndown` and commit the generated file. Tests check that it matches the installed package. Keep `nodejs_compat` in `wrangler.toml`.
 
 ## Troubleshooting
 
-### "GHOST_API_KEY not configured"
-
-You haven't set the secret yet. Run:
-
-```bash
-npx wrangler secret put GHOST_API_KEY
-```
-
-### "Post not found: my-post"
-
-- Check that the post is **published** (drafts aren't available via Content API)
-- Check that the slug matches exactly -- visit your post in Ghost Admin and check the URL slug in post settings
-
-### Worker not intercepting requests
-
-- Make sure your DNS record in Cloudflare is set to **Proxied** (orange cloud), not DNS-only
-- Verify the `routes` pattern in `wrangler.toml` matches your domain
-- Check the worker is deployed: `npx wrangler deployments list`
-
-### "document is not defined" or 1101 errors
-
-This means the worker is using Turndown's browser build instead of the Node.js build. Make sure:
-- `src/turndown.js` exists (the local copy of the Node.js build)
-- `src/index.js` imports from `'./turndown.js'`, not from `'turndown'`
-- `compatibility_flags = ["nodejs_compat"]` is set in `wrangler.toml`
-
-### Wrong content or API errors
-
-- Verify `GHOST_URL` points to the correct origin where Ghost is running
-- Test the Content API directly: `curl "https://yourblog.com/ghost/api/content/posts/?key=YOUR_KEY&limit=1"`
-- Check worker logs: `npx wrangler tail`
+| Symptom | Check |
+| --- | --- |
+| `GHOST_API_KEY not configured` | Run `npx wrangler secret put GHOST_API_KEY` for this Worker. |
+| A `.md` URL returns 404 | Confirm the post or page is published and its full path matches the Ghost URL. |
+| The Worker does not run | Check that the DNS record is proxied and the `routes` entry matches the public domain. |
+| Ghost API requests fail | Check `GHOST_URL` if Ghost uses a separate origin, then inspect `npx wrangler tail`. |
+| `document is not defined` or error 1101 | Keep `src/turndown.js` and the `nodejs_compat` flag; do not import Turndown's browser build. |
 
 ## License
 
 MIT
-
-When updating Turndown, run `npm run vendor:turndown` and commit `src/turndown.js` with the dependency update. Tests check that this file matches the installed package’s non-browser ES module build.
-
-## Validation
-
-Run `npm ci`, `npm test`, and `npm run build` before opening a PR. Tests run the Worker in Miniflare with fixture responses; the build is a deployment dry run. CI runs these checks on Node.js 22.
