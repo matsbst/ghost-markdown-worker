@@ -14,7 +14,7 @@
   },
   "dependencies": {
     "@mixmark-io/domino": "^2.2.0",
-    "turndown": "^7.2.4"
+    "turndown": "^7.2.5"
   },
   "devDependencies": {
     "esbuild": "^0.28.2",
