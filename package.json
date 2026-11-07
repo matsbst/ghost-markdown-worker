@@ -19,6 +19,6 @@
   "devDependencies": {
     "esbuild": "^0.28.2",
     "miniflare": "5.20261101.0-beta",
-    "wrangler": "^4.156.1"
+    "wrangler": "^4.157.0"
   }
 }
